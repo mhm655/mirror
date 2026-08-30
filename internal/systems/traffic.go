@@ -65,7 +65,52 @@ func UpdateEdgeSpeeds(c *Ctx, r *Region) {
 		limit = 1000
 	}
 	night := isNight(s)
+
+	// Incremental pass.
+	//
+	// The speed of an edge is a function of five things: its occupancy, its
+	// blocked lanes, its closure, its lighting, and three city-wide multipliers
+	// (weather, the speed-limit policy, and whether it is dark). On a typical
+	// network fewer than a fifth of edges have any vehicle on them at all, and
+	// the city-wide multipliers change a handful of times a day -- so
+	// recomputing all of them every tick was, by the profile, the single
+	// largest cost in the engine.
+	//
+	// An edge is skipped when it is empty now, was empty last tick, is not
+	// blocked, is not closed and is lit. Under those conditions every input to
+	// the formula is identical to the last time it ran, so the stored result is
+	// already correct: the skip is exactly value-preserving rather than an
+	// approximation, which is why the state digest is unchanged by it. The
+	// city-wide multipliers are folded into a key; when the key moves, the
+	// whole region is recomputed once.
+	key := int64(wmul)<<40 | int64(limit)<<8 | boolBit(night)<<1 | 1
+	full := r.speedKey != key
+	if len(r.prevCount) != len(m.Edges) {
+		r.prevCount = make([]int32, len(m.Edges))
+		full = true
+	}
+	r.speedKey = key
+	tickNow := uint32(c.Tick)
+
 	for _, e := range r.Edges {
+		cnt := s.Edges.Count[e]
+		// An edge is "special" while it is blocked, closed or dark. Special
+		// edges are always recomputed, and -- this is the part the first
+		// version got wrong -- the fact that an edge WAS special is recorded,
+		// so that the tick it stops being special it is recomputed once more.
+		// Without that, a road whose closure expired while empty kept its
+		// impassable speed forever, and every router went on avoiding a road
+		// that had reopened.
+		special := s.Edges.BlockedLanes[e] != 0 ||
+			s.Edges.ClosedUntil[e] > tickNow || !s.Edges.Lit[e]
+		if !full && !special && cnt == 0 && r.prevCount[e] == 0 {
+			continue
+		}
+		if special {
+			r.prevCount[e] = -1
+		} else {
+			r.prevCount[e] = cnt
+		}
 		ed := &m.Edges[e]
 		eff := ed.Lanes - s.Edges.BlockedLanes[e]
 		if eff < 0 {
@@ -80,7 +125,7 @@ func UpdateEdgeSpeeds(c *Ctx, r *Region) {
 		if jam < 1 {
 			jam = 1
 		}
-		xP := int32(int64(s.Edges.Count[e]) * 1000 / int64(jam))
+		xP := int32(int64(cnt) * 1000 / int64(jam))
 		if xP > 940 {
 			xP = 940
 		}
@@ -113,9 +158,16 @@ func UpdateEdgeSpeeds(c *Ctx, r *Region) {
 		if xP >= 850 && uint64(c.Tick)%(30*units.TicksPerSecond) == uint64(e)%(30*units.TicksPerSecond) {
 			r.emit(c.Tick, events.EvtCongestionCritical, events.SevWarning,
 				int64(e), units.MMPerTickToKmh(units.MMPerTick(sp)),
-				int64(s.Edges.Count[e]), int64(jam))
+				int64(cnt), int64(jam))
 		}
 	}
+}
+
+func boolBit(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func isNight(s *state.State) bool {

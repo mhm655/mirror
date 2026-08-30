@@ -37,7 +37,43 @@ type ArenaLookup func(region int32) []world.EdgeID
 // under 400 microseconds for 60k active vehicles, against a phase A that runs
 // for tens of milliseconds.
 func CommitAll(c *Ctx, in []Intent, arena ArenaLookup, g *Region, topo Topology, disp *Dispatcher) {
+	base := len(g.Intents)
 	SortIntents(in)
+	applyIntents(c, in, arena, g, topo)
+
+	// Drain intents produced BY the commit phase.
+	//
+	// Some commit handlers legitimately generate new intents: a transit
+	// vehicle reaching a stop puts every alighting passenger onto a walking
+	// leg. Those land on the global region's buffer after the merged stream
+	// has already been built, so without this pass they are silently dropped
+	// and the passengers never finish their journey.
+	//
+	// That was a real bug, and an instructive one: it was invisible in every
+	// aggregate metric (the trips were still counted as started, the vehicles
+	// still ran) and only surfaced when repartitioning happened to rebuild the
+	// walker index from state and pick the stranded agents back up -- which is
+	// how TestRebalanceIsInvisible caught it.
+	//
+	// The pass count is bounded. A handler that generated intents forever
+	// would otherwise turn one tick into an infinite loop; three rounds is far
+	// more than any current handler needs (the deepest chain is
+	// arrive -> alight -> start walk, which is one).
+	for pass := 0; pass < 3; pass++ {
+		if len(g.Intents) <= base {
+			break
+		}
+		g.spill = append(g.spill[:0], g.Intents[base:]...)
+		g.Intents = g.Intents[:base]
+		SortIntents(g.spill)
+		applyIntents(c, g.spill, arena, g, topo)
+	}
+	if len(g.Intents) > base {
+		g.Intents = g.Intents[:base]
+	}
+}
+
+func applyIntents(c *Ctx, in []Intent, arena ArenaLookup, g *Region, topo Topology) {
 	for i := range in {
 		it := &in[i]
 		switch it.Kind {

@@ -103,6 +103,11 @@ type Region struct {
 	Walkers []int32
 	walkPos map[int32]int32
 
+	// prevCount and speedKey drive the incremental edge-speed pass. See
+	// UpdateEdgeSpeeds.
+	prevCount []int32
+	speedKey  int64
+
 	Router *world.Router
 	Path   []world.EdgeID
 	// PathArena holds routes computed during phase A. Phase A must not touch
@@ -110,7 +115,10 @@ type Region struct {
 	// during the serial commit. Reset every tick.
 	PathArena []world.EdgeID
 	Intents   []Intent
-	Effects   []events.Event
+	// spill holds intents generated *by* the commit phase itself, which are
+	// drained in a second pass. See CommitAll.
+	spill   []Intent
+	Effects []events.Event
 
 	// Per-tick counters, aggregated serially by the engine after commit.
 	// Phase A must never touch state.Metrics directly: several regions run
@@ -184,6 +192,24 @@ func (r *Region) RemoveWalker(a int32) {
 	r.walkPos[moved] = i
 	r.Walkers = r.Walkers[:last]
 	delete(r.walkPos, a)
+}
+
+// ClearVehicles and ClearWalkers drop membership wholesale, for the
+// repartitioner. Clearing and refilling is cheaper and far less error-prone
+// than computing the delta, and it runs once per simulated minute at most.
+// InvalidateSpeedCache forces the next edge-speed pass to recompute every
+// edge. Called after a repartition, when the region's edge set has changed
+// underneath its cache.
+func (r *Region) InvalidateSpeedCache() { r.speedKey = 0 }
+
+func (r *Region) ClearVehicles() {
+	r.Vehicles = r.Vehicles[:0]
+	clear(r.vehPos)
+}
+
+func (r *Region) ClearWalkers() {
+	r.Walkers = r.Walkers[:0]
+	clear(r.walkPos)
 }
 
 func (r *Region) Reset() {

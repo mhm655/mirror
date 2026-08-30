@@ -32,12 +32,16 @@ type Config struct {
 	Workers int
 	// EventRing sizes the effect buffer.
 	EventRing int
+	// Rebalance enables periodic load-based repartitioning. On by default;
+	// the determinism suite runs with it both on and off and requires the
+	// digests to match.
+	Rebalance bool
 }
 
 func DefaultConfig() Config {
 	return Config{
 		Preset: "medium", Seed: 20260830, Population: 40000,
-		StartHour: 7, Regions: 0, Workers: 0, EventRing: 65536,
+		StartHour: 7, Regions: 0, Workers: 0, EventRing: 65536, Rebalance: true,
 	}
 }
 
@@ -45,6 +49,8 @@ func DefaultConfig() Config {
 // timings vary between runs and must never influence a result.
 type TickStats struct {
 	Tick          units.Tick
+	GlobalNanos   int64
+	PhaseA1Nanos  int64
 	PhaseANanos   int64
 	PhaseBNanos   int64
 	TotalNanos    int64
@@ -70,6 +76,7 @@ type Engine struct {
 	global  *systems.Region
 	idx     *systems.PowerIndex
 	disp    *systems.Dispatcher
+	part    *Partitioner
 
 	// Derived ownership tables. Rebuilt from state on every load; never
 	// checkpointed, because they are a pure function of the map and the
@@ -88,17 +95,24 @@ type Engine struct {
 	// PeakTickNanos and a small ring of recent tick durations, for /metrics.
 	recent    [256]int64
 	recentIdx int
+	activeVeh int32
 }
 
-// New creates and seeds a simulation.
+// New creates and seeds a simulation, generating its world.
 func New(cfg Config) *Engine {
+	return NewWithMap(world.Generate(world.DefaultParams(cfg.Preset, cfg.Seed)), cfg)
+}
+
+// NewWithMap creates and seeds a simulation on an existing world.
+//
+// Callers that run many simulations over the same city should go through this
+// and share one Map pointer. The map is immutable, so sharing is safe, and it
+// is by far the largest single allocation in the process.
+func NewWithMap(m *world.Map, cfg Config) *Engine {
 	if cfg.EventRing <= 0 {
 		cfg.EventRing = 65536
 	}
-	m := world.Generate(world.DefaultParams(cfg.Preset, cfg.Seed))
-	if cfg.Regions <= 0 || cfg.Regions > len(m.Districts) {
-		cfg.Regions = len(m.Districts)
-	}
+	cfg.Regions = clampRegions(cfg.Regions)
 	if cfg.Workers <= 0 {
 		cfg.Workers = runtime.GOMAXPROCS(0)
 	}
@@ -122,28 +136,35 @@ func NewFromState(m *world.Map, s *state.State, log *events.Log, cfg Config) (*E
 	if cfg.EventRing <= 0 {
 		cfg.EventRing = 65536
 	}
-	if cfg.Regions <= 0 || cfg.Regions > len(m.Districts) {
-		cfg.Regions = len(m.Districts)
-	}
+	cfg.Regions = clampRegions(cfg.Regions)
 	if cfg.Workers <= 0 {
 		cfg.Workers = runtime.GOMAXPROCS(0)
 	}
 	e := &Engine{Map: m, S: s, Log: log, Ring: events.NewRing(cfg.EventRing), Cfg: cfg}
 	e.buildTopology()
+	// The power index caches the energisation pattern it last propagated. A
+	// restored state may have a different one, so the cache starts cold.
+	e.idx.Invalidate()
+	e.activeVeh = systems.ActiveVehicleCount(s)
 	return e, nil
 }
 
-// buildTopology assigns districts to regions and rebuilds every derived index.
+// clampRegions bounds the worker count.
 //
-// Districts are assigned round-robin to regions rather than by contiguity.
-// That looks wrong at first glance -- surely neighbouring districts should
-// share a worker to minimise handoffs? -- but handoff cost here is a few
-// pointer updates in the serial phase, whereas *load* imbalance costs a whole
-// tick: with contiguous assignment, the region containing downtown does 4x the
-// work of the others and every barrier waits for it. Interleaving spreads the
-// dense centre across workers. When the partitioner becomes adaptive (see
-// docs/architecture/distributed-execution.md), this is the function that
-// changes and nothing else.
+// The upper bound is not GOMAXPROCS: more regions than cores is a legitimate
+// configuration for testing the partitioning, and the benchmark sweeps past it
+// deliberately. It is bounded only against absurdity.
+func clampRegions(n int) int {
+	if n <= 0 {
+		n = runtime.GOMAXPROCS(0)
+	}
+	if n > 64 {
+		n = 64
+	}
+	return n
+}
+
+// buildTopology creates the region workers and their derived indices.
 func (e *Engine) buildTopology() {
 	m := e.Map
 	n := e.Cfg.Regions
@@ -154,47 +175,76 @@ func (e *Engine) buildTopology() {
 	e.global = systems.NewRegion(-1, len(m.Nodes))
 	e.idx = systems.BuildPowerIndex(m)
 	e.disp = systems.NewDispatcher(len(m.Nodes))
+	e.part = NewPartitioner(m, n)
+	e.regionOfEdge = make([]int32, len(m.Edges))
+	e.regionOfAgent = make([]int32, e.S.Agents.Len())
+	e.rebuildOwnership()
+}
 
-	districtRegion := make([]int32, len(m.Districts))
-	for d := range m.Districts {
-		districtRegion[d] = int32(d % n)
+// rebuildOwnership recomputes every derived index from the current partition.
+//
+// Called at startup, after a checkpoint restore, and after each rebalance. It
+// is O(edges + agents), which at one call per simulated minute is a rounding
+// error, and it is the only place ownership is derived -- so a rebalance and a
+// cold start cannot drift apart.
+func (e *Engine) rebuildOwnership() {
+	m, p := e.Map, e.part
+
+	for _, r := range e.regions {
+		r.Edges = r.Edges[:0]
+		r.Signals = r.Signals[:0]
+		r.Nodes = r.Nodes[:0]
+		r.Agents = r.Agents[:0]
+		for i := range r.DepartOut {
+			r.DepartOut[i] = r.DepartOut[i][:0]
+			r.DepartRet[i] = r.DepartRet[i][:0]
+		}
+		r.ClearVehicles()
+		r.ClearWalkers()
+		r.InvalidateSpeedCache()
 	}
 
-	e.regionOfEdge = make([]int32, len(m.Edges))
 	for i := range m.Edges {
-		r := districtRegion[m.Edges[i].District]
-		e.regionOfEdge[i] = r
-		e.regions[r].Edges = append(e.regions[r].Edges, world.EdgeID(i))
+		reg := p.RegionOfEdge(world.EdgeID(i))
+		e.regionOfEdge[i] = reg
+		e.regions[reg].Edges = append(e.regions[reg].Edges, world.EdgeID(i))
 	}
 	for i := range m.Nodes {
-		r := districtRegion[m.Nodes[i].District]
-		e.regions[r].Nodes = append(e.regions[r].Nodes, world.NodeID(i))
+		reg := p.RegionOfNode(world.NodeID(i))
+		e.regions[reg].Nodes = append(e.regions[reg].Nodes, world.NodeID(i))
 	}
 	for i := range m.Signals {
-		r := districtRegion[m.Nodes[m.Signals[i].Node].District]
-		e.regions[r].Signals = append(e.regions[r].Signals, int32(i))
+		// A signal is owned by whoever owns the edges arriving at it, which is
+		// the cell of its node -- the same rule, so the ownership of a signal
+		// and of every approach to it can never disagree.
+		reg := p.RegionOfNode(m.Signals[i].Node)
+		e.regions[reg].Signals = append(e.regions[reg].Signals, int32(i))
 	}
 
 	na := e.S.Agents.Len()
-	e.regionOfAgent = make([]int32, na)
+	if len(e.regionOfAgent) < na {
+		e.regionOfAgent = make([]int32, na)
+	}
 	minutes := int(units.TicksPerDay / units.TicksPerMinute)
 	for i := 0; i < na; i++ {
-		r := districtRegion[e.S.Agents.District[i]]
-		e.regionOfAgent[i] = r
-		reg := e.regions[r]
-		reg.Agents = append(reg.Agents, int32(i))
+		reg := p.RegionOfNode(e.S.Agents.HomeNode[i])
+		e.regionOfAgent[i] = reg
+		r := e.regions[reg]
+		r.Agents = append(r.Agents, int32(i))
 		out := int(e.S.Agents.DepartOut[i]) / units.TicksPerMinute
 		ret := int(e.S.Agents.DepartRet[i]) / units.TicksPerMinute
 		if out >= 0 && out < minutes {
-			reg.DepartOut[out] = append(reg.DepartOut[out], int32(i))
+			r.DepartOut[out] = append(r.DepartOut[out], int32(i))
 		}
 		if ret >= 0 && ret < minutes {
-			reg.DepartRet[ret] = append(reg.DepartRet[ret], int32(i))
+			r.DepartRet[ret] = append(r.DepartRet[ret], int32(i))
 		}
 	}
 
-	// Rebuild live vehicle and walker membership from state.
-	e.vehRegion = make([]int32, e.S.Vehicles.Len())
+	// Live entities follow their owning edge or home node.
+	if len(e.vehRegion) < e.S.Vehicles.Len() {
+		e.vehRegion = make([]int32, e.S.Vehicles.Len())
+	}
 	for i := range e.vehRegion {
 		e.vehRegion[i] = -1
 	}
@@ -206,11 +256,13 @@ func (e *Engine) buildTopology() {
 		if ed < 0 {
 			continue
 		}
-		r := e.regionOfEdge[ed]
-		e.vehRegion[i] = r
-		e.regions[r].AddVehicle(int32(i))
+		reg := e.regionOfEdge[ed]
+		e.vehRegion[i] = reg
+		e.regions[reg].AddVehicle(int32(i))
 	}
-	e.walkRegion = make([]int32, na)
+	if len(e.walkRegion) < na {
+		e.walkRegion = make([]int32, na)
+	}
 	for i := range e.walkRegion {
 		e.walkRegion[i] = -1
 	}
@@ -218,9 +270,9 @@ func (e *Engine) buildTopology() {
 		// WalkTicks carries an explicit sentinel (systems.NotWalking), so the
 		// walker set is read directly out of state rather than inferred.
 		if e.S.Agents.WalkTicks[i] >= 0 {
-			r := e.regionOfAgent[i]
-			e.walkRegion[i] = r
-			e.regions[r].AddWalker(int32(i))
+			reg := e.regionOfAgent[i]
+			e.walkRegion[i] = reg
+			e.regions[reg].AddWalker(int32(i))
 		}
 	}
 }
@@ -309,6 +361,8 @@ func (e *Engine) Tick() {
 	t0 := time.Now()
 	c := &systems.Ctx{Map: e.Map, S: e.S, Tick: e.S.Tick}
 
+	e.maybeRebalance()
+
 	e.global.Reset()
 	for i := range e.regions {
 		e.regions[i].Reset()
@@ -320,12 +374,14 @@ func (e *Engine) Tick() {
 	}
 
 	// 1. city-wide systems
+	tg := time.Now()
 	systems.WeatherSystem(c, e.global)
 	systems.PowerSystem(c, e.global, e.idx)
 	systems.CommsSystem(c, e.global)
 	systems.HospitalSystem(c, e.global)
 	systems.IncidentSystem(c, e.global, e.idx, e.disp)
 	systems.TransitDispatch(c, e.global)
+	globalNanos := time.Since(tg).Nanoseconds()
 
 	// 2 & 3. parallel phases with a barrier between them
 	ta := time.Now()
@@ -333,6 +389,7 @@ func (e *Engine) Tick() {
 		systems.UpdateEdgeSpeeds(c, r)
 		systems.UpdateSignals(c, r)
 	})
+	phaseA1 := time.Since(ta).Nanoseconds()
 	e.runPhase(func(r *systems.Region) {
 		systems.Departures(c, r)
 		systems.Walkers(c, r)
@@ -383,8 +440,15 @@ func (e *Engine) Tick() {
 
 	// 5. maintenance
 	e.S.CompactRoutes()
-	active := systems.ActiveVehicleCount(e.S)
-	systems.SampleMetrics(c, active)
+	// The active-vehicle scan is O(vehicle slots) and only the per-minute
+	// sample and the UI need it, so it runs on the minute boundary and is
+	// cached in between.
+	if int64(e.S.Tick)/units.TicksPerMinute != e.S.Metrics.LastSeriesMinute {
+		e.activeVeh = systems.ActiveVehicleCount(e.S)
+	}
+	systems.SampleMetrics(c, e.activeVeh)
+	active := e.activeVeh
+	serialNanos := globalNanos + time.Since(tb).Nanoseconds()
 
 	e.S.Tick++
 
@@ -393,10 +457,15 @@ func (e *Engine) Tick() {
 	e.recentIdx++
 	sp := int32(0)
 	if total > 0 {
-		sp = int32(phaseB * 100 / total)
+		// The serial fraction includes the city-wide systems and the
+		// maintenance pass, not just the commit. Reporting only the commit
+		// would understate it and make the Amdahl prediction in the benchmark
+		// harness a lie.
+		sp = int32(serialNanos * 100 / total)
 	}
 	e.Stat = TickStats{
-		Tick: e.S.Tick, PhaseANanos: phaseA, PhaseBNanos: phaseB, TotalNanos: total,
+		Tick: e.S.Tick, GlobalNanos: globalNanos, PhaseA1Nanos: phaseA1,
+		PhaseANanos: phaseA, PhaseBNanos: phaseB, TotalNanos: total,
 		Intents: nIntents, Crossings: crossings, Moved: moved, ActiveVeh: active,
 		RouteQueries: uint64(e.S.Metrics.RouteQueries), RouteExpands: expands, SerialPercent: sp,
 	}
@@ -486,3 +555,24 @@ func (e *Engine) RecentTickNanos(out []int64) []int64 {
 	}
 	return out
 }
+
+// RegionOfDistrict reports which worker owns a district's centre.
+//
+// Districts no longer map one-to-one onto workers -- execution is partitioned
+// on a separate cell grid -- so this is a display convenience, not an
+// ownership fact. It answers "which worker is mostly responsible for this
+// place", which is what the map overlay wants.
+func (e *Engine) RegionOfDistrict(d world.DistrictID) int32 {
+	if int(d) >= len(e.Map.Districts) || e.part == nil {
+		return 0
+	}
+	dd := &e.Map.Districts[d]
+	n := e.Map.Grid.Nearest(e.Map.Nodes, dd.CX, dd.CY)
+	if n < 0 {
+		return 0
+	}
+	return e.part.RegionOfNode(n)
+}
+
+// Partition exposes the partitioner for the API and the chaos lab.
+func (e *Engine) Partition() *Partitioner { return e.part }

@@ -78,8 +78,17 @@ func SetWeather(c *Ctx, g *Region, cond, temp, wind int32, durationTicks int64) 
 
 // SampleMetrics pushes one time-series sample per simulated minute and derives
 // the fuel and emissions totals from the cumulative counters.
-func SampleMetrics(c *Ctx, activeVehicles int32) {
-	m, s := c.Map, c.S
+//
+// The whole body is gated on the minute boundary. An earlier version computed
+// the network aggregate every tick and then discarded it 599 times out of 600;
+// that was a full pass over every edge per tick for a value nothing read.
+// Returns whether a sample was taken so the caller can avoid its own scans.
+func SampleMetrics(c *Ctx, activeVehicles int32) bool {
+	s := c.S
+	if int64(c.Tick)/units.TicksPerMinute == s.Metrics.LastSeriesMinute {
+		return false
+	}
+	m := c.Map
 	var speedSum, speedN int64
 	var congested, counted int64
 	for e := range s.Edges.Speed {
@@ -127,7 +136,7 @@ func SampleMetrics(c *Ctx, activeVehicles int32) {
 		}
 	}
 	s.Metrics.FuelMl, s.Metrics.CO2G = FuelAndEmissions(s.Metrics.DistanceMM, s.Metrics.StoppedVehicleTicks)
-	s.Metrics.MaybeSample(c.Tick, activeVehicles, avgKph, congP, hospP, poweredP, open)
+	return s.Metrics.MaybeSample(c.Tick, activeVehicles, avgKph, congP, hospP, poweredP, open)
 }
 
 // ActiveVehicleCount counts vehicles currently on the network.

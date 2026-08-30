@@ -1,0 +1,45 @@
+MIRROR benchmark  go=go1.27.0  GOMAXPROCS=12  preset=medium  population=60000
+warm-up=42000 ticks, measured=6000 ticks (10m00s of simulated time)
+
+scenario           regions peakVeh  ticks/s  realtime   meanMs    p95Ms    p99Ms    maxMs    ser%  allocKB/t   vehTicks/s
+------------------------------------------------------------------------------------------------------------------------------
+medium/60k/r1            1    2617     2923    292.3x     0.34     1.01     1.01     2.01    4.7%        0.6      7421507
+medium/60k/r2            2    2617     3904    390.4x     0.26     1.01     1.01     2.02    4.5%        0.8      9911370
+medium/60k/r3            3    2617     4441    444.1x     0.22     1.00     1.01     1.99    4.7%        0.9     11276156
+medium/60k/r4            4    2617     4528    452.8x     0.22     1.00     1.01     2.01    4.9%        1.0     11496123
+medium/60k/r6            6    2617     4430    443.0x     0.23     1.00     1.01     2.01    4.7%        1.2     11247061
+medium/60k/r9            9    2617     4439    443.9x     0.23     1.00     1.01     2.01    4.6%        1.6     11271781
+medium/60k/r12          12    2617     4319    431.9x     0.23     1.00     1.01     2.00    4.2%        1.9     10965160
+
+Parallel scaling against the single-region run:
+  regions=2   speedup 1.34x   Amdahl ceiling at 5% serial: 1.91x   efficiency  70%
+  regions=3   speedup 1.52x   Amdahl ceiling at 5% serial: 2.74x   efficiency  55%
+  regions=4   speedup 1.55x   Amdahl ceiling at 5% serial: 3.51x   efficiency  44%
+  regions=6   speedup 1.52x   Amdahl ceiling at 5% serial: 4.86x   efficiency  31%
+  regions=9   speedup 1.52x   Amdahl ceiling at 5% serial: 6.54x   efficiency  23%
+  regions=12  speedup 1.48x   Amdahl ceiling at 5% serial: 7.92x   efficiency  19%
+
+Mean phase breakdown (ms):
+  scenario               global  A1 speeds/sig  A2 move/route   B commit
+  medium/60k/r1           0.009          0.106          0.188      0.038
+  medium/60k/r2           0.011          0.066          0.143      0.034
+  medium/60k/r3           0.010          0.046          0.130      0.037
+  medium/60k/r4           0.012          0.047          0.123      0.037
+  medium/60k/r6           0.009          0.053          0.123      0.038
+  medium/60k/r9           0.010          0.049          0.128      0.035
+  medium/60k/r12          0.010          0.051          0.135      0.032
+
+Note: the per-tick clock on this platform is coarser than a tick takes, so the
+percentile columns are quantised. ticks/s is measured over the whole run and is
+unaffected; treat it as the authoritative throughput number.
+
+Digests (identical across region counts means the partitioning is deterministic):
+  medium/60k/r1      96e0191f569e330f
+  medium/60k/r2      96e0191f569e330f
+  medium/60k/r3      96e0191f569e330f
+  medium/60k/r4      96e0191f569e330f
+  medium/60k/r6      96e0191f569e330f
+  medium/60k/r9      96e0191f569e330f
+  medium/60k/r12     96e0191f569e330f
+
+  All region counts produced identical state.

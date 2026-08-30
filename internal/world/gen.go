@@ -192,6 +192,33 @@ func Generate(p GenParams) *Map {
 		mkEdge(pr.b, pr.a)
 	}
 
+	// Renumber edges so that every district's edges occupy a contiguous id
+	// range.
+	//
+	// This is a pure locality optimisation and it is worth a lot. Edges are
+	// created in grid order, which interleaves districts throughout the array;
+	// since a region owns whole districts and writes EdgeState.Speed and
+	// TravelTicks for its own edges every tick, interleaved ids mean several
+	// region goroutines writing into the same cache lines. That is false
+	// sharing on the hottest arrays in the engine, and it showed up as
+	// parallel efficiency collapsing past three regions.
+	//
+	// Sorting by (district, from, to) is deterministic, so the renumbering is
+	// part of the map's identity and is covered by the map hash. It must
+	// happen here, before the CSR, the signal assignment and the transit
+	// routes are built, because those are the first structures to capture
+	// edge ids.
+	sort.SliceStable(m.Edges, func(i, j int) bool {
+		a, b := &m.Edges[i], &m.Edges[j]
+		if a.District != b.District {
+			return a.District < b.District
+		}
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		return a.To < b.To
+	})
+
 	buildCSR(m)
 
 	// ---- signals ---------------------------------------------------------

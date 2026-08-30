@@ -16,8 +16,22 @@ type PowerIndex struct {
 	EdgesBySub   [][]world.EdgeID
 	TowersBySub  [][]world.TowerID
 	HospsBySub   [][]world.HospitalID
-	// SubsByDistrict lets the blackout event name a district.
-	POIsBySub [][]world.POIID
+	POIsBySub    [][]world.POIID
+
+	// prevOnline caches the last propagated energisation pattern.
+	//
+	// Propagating substation state downstream touches every edge, signal and
+	// tower on the map. Doing that unconditionally, every tick, was costing
+	// more than the entire vehicle movement system on a quiet network -- for a
+	// value that changes a handful of times an hour. The propagation function
+	// is idempotent and is a pure function of Subs.Online, so skipping it when
+	// nothing changed produces identical state; TestPowerPropagationIdempotent
+	// pins that down.
+	prevOnline []bool
+	primed     bool
+	// offline is the current set of de-energised substations, so the per-tick
+	// battery and generator countdowns iterate only what is actually affected.
+	offline []int
 }
 
 func BuildPowerIndex(m *world.Map) *PowerIndex {
@@ -54,8 +68,13 @@ func BuildPowerIndex(m *world.Map) *PowerIndex {
 			p.POIsBySub[f] = append(p.POIsBySub[f], m.POIs[i].ID)
 		}
 	}
+	p.prevOnline = make([]bool, n)
 	return p
 }
+
+// Invalidate forces the next propagation to run in full. Called after a
+// checkpoint restore, where the cached pattern belongs to a different run.
+func (p *PowerIndex) Invalidate() { p.primed = false }
 
 // demandFactorP is the diurnal load curve in permille of connected load.
 // Two peaks -- morning ramp and the 18:00-21:00 domestic peak -- which is the
@@ -151,8 +170,10 @@ func PowerSystem(c *Ctx, g *Region, idx *PowerIndex) {
 		}
 	}
 
-	// Apply downstream state.
+	// Propagate energisation only when it actually changed, then run the
+	// per-tick countdowns over the affected equipment.
 	applyPowerDownstream(c, g, idx)
+	tickPowerConsumables(c, g, idx)
 }
 
 func tripSubstation(c *Ctx, g *Region, idx *PowerIndex, id world.SubstationID, load, capacity int32) {
@@ -193,11 +214,41 @@ func ForceOutage(c *Ctx, g *Region, idx *PowerIndex, id world.SubstationID, dura
 	applyPowerDownstream(c, g, idx)
 }
 
+// applyPowerDownstream pushes substation energisation onto everything the
+// substation feeds. Idempotent, and skipped entirely when nothing changed.
 func applyPowerDownstream(c *Ctx, g *Region, idx *PowerIndex) {
 	m, s := c.Map, c.S
-	var outageUnits int64
+	changed := !idx.primed
+	if idx.primed {
+		for i := range s.Subs.Online {
+			if s.Subs.Online[i] != idx.prevOnline[i] {
+				changed = true
+				break
+			}
+		}
+	}
+	// The outage accounting and the dark-signal count are per-tick values, so
+	// they are recomputed from the cached offline set whether or not the
+	// topology changed.
+	var outageUnits, unpowered int64
+	if !changed {
+		for _, i := range idx.offline {
+			outageUnits += int64(len(idx.POIsBySub[i]))
+			unpowered += int64(len(idx.SignalsBySub[i]))
+		}
+		s.Metrics.OutageNodeTicks += outageUnits
+		s.Metrics.SignalsUnpowered = unpowered
+		return
+	}
+
+	idx.offline = idx.offline[:0]
 	for i := range m.Substations {
 		up := s.Subs.Online[i]
+		idx.prevOnline[i] = up
+		if !up {
+			idx.offline = append(idx.offline, i)
+			outageUnits += int64(len(idx.POIsBySub[i]))
+		}
 		for _, si := range idx.SignalsBySub[i] {
 			if s.Signals.Powered[si] != up {
 				s.Signals.Powered[si] = up
@@ -211,13 +262,39 @@ func applyPowerDownstream(c *Ctx, g *Region, idx *PowerIndex) {
 			s.Edges.Lit[e] = up
 		}
 		for _, t := range idx.TowersBySub[i] {
-			if up {
+			if up && !s.Towers.Powered[t] && s.Towers.BatteryMin[t] >= 0 {
 				s.Towers.Powered[t] = true
-				// Batteries recharge slowly once mains returns.
-				if s.Towers.BatteryMin[t] < m.Towers[t].BatteryMin {
-					s.Towers.BatteryMin[t]++
-				}
-			} else if s.Towers.BatteryMin[t] > 0 {
+			}
+		}
+		for _, h := range idx.HospsBySub[i] {
+			if up {
+				s.Hosps.OnBackup[h] = false
+			} else if !s.Hosps.OnBackup[h] {
+				s.Hosps.OnBackup[h] = true
+				g.emit(c.Tick, events.EvtHospitalOnBackup, events.SevWarning, int64(h), 0, 0, 0)
+			}
+		}
+	}
+	idx.primed = true
+	for i := range s.Signals.Powered {
+		if !s.Signals.Powered[i] {
+			unpowered++
+		}
+	}
+	s.Metrics.OutageNodeTicks += outageUnits
+	s.Metrics.SignalsUnpowered = unpowered
+}
+
+// tickPowerConsumables runs the battery and generator countdowns.
+//
+// It iterates only the equipment fed by a de-energised substation, plus a
+// once-a-minute recharge sweep. On a healthy grid the offline set is empty and
+// this costs nothing, which is the common case by a wide margin.
+func tickPowerConsumables(c *Ctx, g *Region, idx *PowerIndex) {
+	m, s := c.Map, c.S
+	for _, i := range idx.offline {
+		for _, t := range idx.TowersBySub[i] {
+			if s.Towers.BatteryMin[t] > 0 {
 				if uint64(c.Tick)%units.TicksPerMinute == 0 {
 					s.Towers.BatteryMin[t]--
 				}
@@ -227,35 +304,28 @@ func applyPowerDownstream(c *Ctx, g *Region, idx *PowerIndex) {
 			}
 		}
 		for _, h := range idx.HospsBySub[i] {
-			if up {
-				if s.Hosps.OnBackup[h] {
-					s.Hosps.OnBackup[h] = false
-				}
-				if s.Hosps.BackupLeft[h] < m.Hospitals[h].BackupMinutes*units.TicksPerMinute {
-					s.Hosps.BackupLeft[h] += 2 // refuelling
-				}
-			} else {
-				if !s.Hosps.OnBackup[h] {
-					s.Hosps.OnBackup[h] = true
-					g.emit(c.Tick, events.EvtHospitalOnBackup, events.SevWarning, int64(h), 0, 0, 0)
-				}
-				if s.Hosps.BackupLeft[h] > 0 {
-					s.Hosps.BackupLeft[h]--
-				}
+			if s.Hosps.BackupLeft[h] > 0 {
+				s.Hosps.BackupLeft[h]--
 			}
 		}
-		if !up {
-			outageUnits += int64(len(idx.POIsBySub[i]))
+	}
+	// Recharge and refuel, once per simulated minute, only where needed.
+	if uint64(c.Tick)%units.TicksPerMinute != 0 {
+		return
+	}
+	for t := range m.Towers {
+		if s.Towers.Powered[t] && s.Towers.BatteryMin[t] < m.Towers[t].BatteryMin {
+			s.Towers.BatteryMin[t]++
 		}
 	}
-	s.Metrics.OutageNodeTicks += outageUnits
-	unpowered := int64(0)
-	for i := range s.Signals.Powered {
-		if !s.Signals.Powered[i] {
-			unpowered++
+	for h := range m.Hospitals {
+		if !s.Hosps.OnBackup[h] && s.Hosps.BackupLeft[h] < m.Hospitals[h].BackupMinutes*units.TicksPerMinute {
+			s.Hosps.BackupLeft[h] += 2 * units.TicksPerMinute
+			if s.Hosps.BackupLeft[h] > m.Hospitals[h].BackupMinutes*units.TicksPerMinute {
+				s.Hosps.BackupLeft[h] = m.Hospitals[h].BackupMinutes * units.TicksPerMinute
+			}
 		}
 	}
-	s.Metrics.SignalsUnpowered = unpowered
 }
 
 // CommsSystem models cell-site loading.

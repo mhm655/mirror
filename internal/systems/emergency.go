@@ -37,10 +37,18 @@ func IncidentSystem(c *Ctx, g *Region, idx *PowerIndex, disp *Dispatcher) {
 		disp.Consider(c, g, int32(i))
 	}
 	// Reopen roads whose closure has lapsed.
-	for e := range s.Edges.ClosedUntil {
-		if s.Edges.ClosedUntil[e] != 0 && tick >= s.Edges.ClosedUntil[e] {
-			s.Edges.ClosedUntil[e] = 0
-			g.emit(c.Tick, events.EvtRoadReopened, events.SevNotice, int64(e), 0, 0, 0)
+	//
+	// Scanned once per simulated second rather than every tick. Closures are
+	// specified to the second, so nothing is lost, and the full scan over
+	// every edge was one of the largest serial costs in the tick on a network
+	// with no closures at all -- the pathological case for an unconditional
+	// full-array sweep.
+	if uint64(c.Tick)%units.TicksPerSecond == 0 {
+		for e := range s.Edges.ClosedUntil {
+			if s.Edges.ClosedUntil[e] != 0 && tick >= s.Edges.ClosedUntil[e] {
+				s.Edges.ClosedUntil[e] = 0
+				g.emit(c.Tick, events.EvtRoadReopened, events.SevNotice, int64(e), 0, 0, 0)
+			}
 		}
 	}
 }
