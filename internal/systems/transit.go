@@ -48,6 +48,7 @@ func TransitDispatch(c *Ctx, g *Region) {
 		}
 		id := s.NewVehicle(kind, -1, leg[0], rt.Stops[1])
 		s.AllocRoute(id, leg)
+		s.Vehicles.RouteIdx[id] = 1
 		s.Vehicles.TransitRoute[id] = world.RouteID(ri)
 		s.Vehicles.TransitLeg[id] = 0
 		s.Vehicles.TransitDir[id] = 0

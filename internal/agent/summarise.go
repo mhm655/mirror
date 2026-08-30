@@ -436,6 +436,16 @@ func summariseComparison(s Step, minutes int64) string {
 	return b.String()
 }
 
+// plural picks the right noun and verb for a count. Small, but "1 people are
+// stranded" in an operations report undermines confidence in every other
+// number on the page.
+func plural(n int64, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
 func shortName(n string) string {
 	if i := strings.Index(n, " - "); i > 0 {
 		return n[:i]

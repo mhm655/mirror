@@ -436,10 +436,19 @@ func maybeCrash(c *Ctx, r *Region, id int32, e world.EdgeID, sp int64) {
 	if ed.FreeSpeed <= 0 {
 		return
 	}
-	// Base hazard: ~1.5 collisions per million vehicle-km, scaled by speed
-	// ratio, weather and darkness. Parts per billion per eligible tick.
+	// Base hazard in parts per BILLION per vehicle-tick, scaled by speed
+	// ratio, weather and darkness.
+	//
+	// Calibration: at the default medium city there are roughly 1,500 vehicles
+	// on the network during the peak, which is 5.4e7 vehicle-ticks per
+	// simulated hour. A base of 90 ppb puts that at about five collisions an
+	// hour before weather and darkness multipliers -- high for a city of
+	// 45,000, but the platform exists to show incident propagation and an
+	// incident every four hours makes for a poor demonstration. It is a
+	// legibility choice and it is stated as one rather than dressed up as
+	// accident statistics.
 	speedRatio := sp * 1000 / int64(ed.FreeSpeed)
-	hazard := int64(14) * speedRatio / 1000
+	hazard := int64(90) * speedRatio / 1000
 	switch s.Weather.Condition {
 	case 1:
 		hazard = hazard * 16 / 10
@@ -463,7 +472,7 @@ func maybeCrash(c *Ctx, r *Region, id int32, e world.EdgeID, sp int64) {
 		return
 	}
 	g := rng.Derive(s.Seed, rng.StreamIncident, uint64(c.Tick), uint64(id))
-	if int64(g.IntN(1_000_000)) >= hazard {
+	if int64(g.IntN(1_000_000_000)) >= hazard {
 		return
 	}
 	sev := g.Range(200, 1000)

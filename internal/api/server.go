@@ -392,7 +392,11 @@ func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	var out []EventView
+	// Initialised rather than nil: a nil slice marshals to `null`, and every
+	// client then has to defend against a list endpoint that sometimes returns
+	// null and sometimes an array. Returning an empty array always is the
+	// cheaper contract.
+	out := []EventView{}
 	var next, missed uint64
 	sim.Read(func(e *engine.Engine) {
 		var buf []events.Event
@@ -419,7 +423,7 @@ func (s *Server) getCommands(w http.ResponseWriter, r *http.Request) {
 		Kind string `json:"kind"`
 		Text string `json:"text"`
 	}
-	var out []cmdView
+	out := []cmdView{}
 	sim.Read(func(e *engine.Engine) {
 		for _, c := range e.Log.Cmds {
 			out = append(out, cmdView{
@@ -450,7 +454,7 @@ func (s *Server) getIncidents(w http.ResponseWriter, r *http.Request) {
 		X             int64  `json:"x"`
 		Y             int64  `json:"y"`
 	}
-	var out []incView
+	out := []incView{}
 	sim.Read(func(e *engine.Engine) {
 		for i := range e.S.Incidents {
 			in := &e.S.Incidents[i]
@@ -837,21 +841,25 @@ func (s *Server) chaos(w http.ResponseWriter, r *http.Request) {
 // object allocation. The map is fetched once per session, so this is a
 // one-time cost -- but it is a one-time cost the user waits for.
 type mapView struct {
-	Name       string         `json:"name"`
-	Hash       string         `json:"hash"`
-	Width      int64          `json:"width"`
-	Height     int64          `json:"height"`
-	NodeX      []int32        `json:"nodeX"`
-	NodeY      []int32        `json:"nodeY"`
-	NodeSignal []int32        `json:"nodeSignal"`
-	EdgeFrom   []int32        `json:"edgeFrom"`
-	EdgeTo     []int32        `json:"edgeTo"`
-	EdgeClass  []uint8        `json:"edgeClass"`
-	EdgeDist   []int32        `json:"edgeDistrict"`
-	Districts  []districtView `json:"districts"`
-	POIs       []poiView      `json:"pois"`
-	Signals    []int32        `json:"signalNodes"`
-	Routes     []routeView    `json:"routes"`
+	Name       string  `json:"name"`
+	Hash       string  `json:"hash"`
+	Width      int64   `json:"width"`
+	Height     int64   `json:"height"`
+	NodeX      []int32 `json:"nodeX"`
+	NodeY      []int32 `json:"nodeY"`
+	NodeSignal []int32 `json:"nodeSignal"`
+	EdgeFrom   []int32 `json:"edgeFrom"`
+	EdgeTo     []int32 `json:"edgeTo"`
+	// int32, not uint8: encoding/json renders a []byte as a base64 STRING, so a
+	// []uint8 here silently ships the road classes as "AwMDAwEDAwAD" and the
+	// client decodes character codes out of it. Nothing errors on either side --
+	// the roads simply stop being drawn.
+	EdgeClass []int32        `json:"edgeClass"`
+	EdgeDist  []int32        `json:"edgeDistrict"`
+	Districts []districtView `json:"districts"`
+	POIs      []poiView      `json:"pois"`
+	Signals   []int32        `json:"signalNodes"`
+	Routes    []routeView    `json:"routes"`
 }
 
 type districtView struct {
@@ -885,6 +893,23 @@ func (s *Server) getMap(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The map is immutable for a given map hash, so it is validated by ETag
+	// rather than cached blind for an hour.
+	//
+	// A time-based cache is wrong here and wrong in an unpleasantly quiet way:
+	// simulation ids are reused across server restarts, so a client that cached
+	// /simulations/sim-0001/map yesterday would render today's city with
+	// yesterday's road network and no error anywhere. Content validation costs
+	// one conditional request and cannot go stale.
+	var etag string
+	sim.Read(func(e *engine.Engine) { etag = `"` + fmt.Sprintf("%016x", e.Map.Hash) + `"` })
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
 	var out mapView
 	sim.Read(func(e *engine.Engine) {
 		m := e.Map
@@ -894,7 +919,7 @@ func (s *Server) getMap(w http.ResponseWriter, r *http.Request) {
 			NodeX: make([]int32, len(m.Nodes)), NodeY: make([]int32, len(m.Nodes)),
 			NodeSignal: make([]int32, len(m.Nodes)),
 			EdgeFrom:   make([]int32, len(m.Edges)), EdgeTo: make([]int32, len(m.Edges)),
-			EdgeClass: make([]uint8, len(m.Edges)), EdgeDist: make([]int32, len(m.Edges)),
+			EdgeClass: make([]int32, len(m.Edges)), EdgeDist: make([]int32, len(m.Edges)),
 		}
 		for i := range m.Nodes {
 			out.NodeX[i] = int32(m.Nodes[i].X)
@@ -904,7 +929,7 @@ func (s *Server) getMap(w http.ResponseWriter, r *http.Request) {
 		for i := range m.Edges {
 			out.EdgeFrom[i] = int32(m.Edges[i].From)
 			out.EdgeTo[i] = int32(m.Edges[i].To)
-			out.EdgeClass[i] = uint8(m.Edges[i].Class)
+			out.EdgeClass[i] = int32(m.Edges[i].Class)
 			out.EdgeDist[i] = int32(m.Edges[i].District)
 		}
 		for i := range m.Districts {
@@ -954,7 +979,6 @@ func (s *Server) getMap(w http.ResponseWriter, r *http.Request) {
 			out.Routes = append(out.Routes, rv)
 		}
 	})
-	w.Header().Set("Cache-Control", "public, max-age=3600")
 	writeJSON(w, 200, out)
 }
 

@@ -221,6 +221,11 @@ func (d *Dispatcher) dispatch(c *Ctx, g *Region, inc int32, kind state.VehicleKi
 	// else; the dispatcher runs there already, so it may allocate directly.
 	id := s.NewVehicle(kind, -1, path[0], in.Node)
 	s.AllocRoute(id, path)
+	// The unit is placed ON the first edge of its route, so the next edge to
+	// traverse is index 1. Leaving this at 0 made every dispatched unit
+	// re-traverse its first link, adding a link's worth of latency to every
+	// response time we report.
+	s.Vehicles.RouteIdx[id] = 1
 	s.Vehicles.Payload[id] = int64ToI32(int64(inc))
 	s.Vehicles.SpawnTick[id] = uint32(c.Tick)
 	s.Edges.Count[path[0]]++
@@ -274,6 +279,7 @@ func EmergencyArrived(c *Ctx, g *Region, id int32) {
 					v.Dest[id] = m.Hospitals[h].Node
 					v.Payload[id] = -2 - int32(h) // encodes "carrying to hospital h"
 					s.AllocRoute(id, path)
+					v.RouteIdx[id] = 1
 					s.Edges.Count[path[0]]++
 					s.Edges.EnteredTotal[path[0]]++
 					return

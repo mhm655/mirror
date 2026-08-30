@@ -169,6 +169,10 @@ func (m *Manager) Create(name string, cfg engine.Config) (*Sim, error) {
 	m.mu.Unlock()
 
 	e := engine.NewWithMap(m.mapFor(cfg), cfg)
+	// The engine resolves defaults (region count, worker count) at
+	// construction; keep the resolved values so the API reports what is
+	// actually running rather than what was asked for.
+	cfg = e.Cfg
 	if name == "" {
 		name = "Baseline"
 	}
