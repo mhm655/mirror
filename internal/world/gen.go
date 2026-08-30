@@ -238,6 +238,20 @@ func Generate(p GenParams) *Map {
 	genInfrastructure(m, &g, cols, rows, p)
 	genTransit(m, cols, rows, p)
 
+	m.ReverseEdge = make([]EdgeID, len(m.Edges))
+	for i := range m.ReverseEdge {
+		m.ReverseEdge[i] = NoEdge
+	}
+	for i := range m.Edges {
+		m.ReverseEdge[i] = edgeBetween(m, m.Edges[i].To, m.Edges[i].From)
+	}
+	m.RouteStopBase = make([]int32, len(m.Routes))
+	var totalStops int32
+	for i := range m.Routes {
+		m.RouteStopBase[i] = totalStops
+		totalStops += int32(len(m.Routes[i].Stops))
+	}
+	m.TotalStops = totalStops
 	m.MaxSpeed = m.MaxFreeSpeed()
 	m.Grid = BuildSpatialGrid(m.Nodes, m.Width, m.Height, 4*p.BlockSize)
 	indexPOIs(m)
@@ -399,6 +413,23 @@ func genInfrastructure(m *Map, g *rng.PCG32, cols, rows int32, p GenParams) {
 	for i := range m.Edges {
 		nd := &m.Nodes[m.Edges[i].To]
 		m.Edges[i].Feeder = nearestSS(nd.X, nd.Y)
+	}
+
+	// Connected load per substation. Coefficients are per-unit-capacity:
+	// 1.1 kW per dwelling, 0.9 kW per job, 0.6 kW per school place,
+	// 2.5 kW per hospital bed (hospitals are extraordinarily power dense),
+	// 1.4 kW per business unit.
+	loadPerUnit := [...]int32{11, 9, 6, 25, 14, 5}
+	for i := range m.POIs {
+		p := &m.POIs[i]
+		if p.Feeder >= 0 {
+			m.Substations[p.Feeder].BaseKW += p.Capacity * loadPerUnit[p.Kind] / 10
+		}
+	}
+	for i := range m.Signals {
+		if m.Signals[i].Feeder >= 0 {
+			m.Substations[m.Signals[i].Feeder].BaseKW += 2
+		}
 	}
 
 	// Hospitals.

@@ -133,6 +133,10 @@ type Substation struct {
 	District DistrictID
 	// CapacityKW is the thermal limit. Exceeding it for SustainTicks trips it.
 	CapacityKW int32
+	// BaseKW is the connected load of everything fed by this substation at a
+	// demand factor of 1.0. Precomputed at generation time because it is a
+	// property of the static network, not of the simulation.
+	BaseKW int32
 	// Neighbours it can shed load onto, sorted ascending for determinism.
 	Neighbours []SubstationID
 }
@@ -210,6 +214,14 @@ type Map struct {
 	HomesByDistrict [][]POIID
 	WorksByDistrict [][]POIID
 	Grid            *SpatialGrid
+	// ReverseEdge[e] is the edge running the opposite way along the same link,
+	// or NoEdge. Transit routes traverse it on the return run, and the
+	// emergency dispatcher uses it to reach the far side of a blocked road.
+	ReverseEdge []EdgeID
+	// RouteStopBase flattens (route, stopIndex) into a single index space so
+	// per-stop dynamic arrays can be plain slices instead of nested ones.
+	RouteStopBase []int32
+	TotalStops    int32
 	// MaxSpeed is the highest free-flow speed in the network. Precomputed at
 	// generation time rather than memoised lazily: the Map is shared read-only
 	// across every region goroutine and every forked scenario, so a lazily
