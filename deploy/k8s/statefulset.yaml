@@ -1,0 +1,101 @@
+# MIRROR runs as a StatefulSet, not a Deployment, for two reasons documented
+# in docs/BLUEPRINT.md section 18:
+#
+#   1. A simulation has identity. Its checkpoints on disk belong to it
+#      specifically -- replica N is not interchangeable with replica N+1 the
+#      way a stateless web server's replicas are.
+#   2. Sessions are sticky. A WebSocket stream is bound to the process
+#      holding that simulation's in-memory state; there is nothing to load
+#      balance across replicas for a single simulation.
+#
+# This does NOT distribute one simulation across pods -- that is the
+# multi-process migration described in ADR-007/ADR-008, which does not exist
+# yet. This manifest runs one MIRROR process per pod, each independently
+# capable of hosting many simulations up to that pod's own CPU/memory limit.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mirror
+  labels:
+    app.kubernetes.io/name: mirror
+spec:
+  serviceName: mirror
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mirror
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mirror
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+      containers:
+        - name: mirrord
+          image: mirror:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MIRROR_AUTH_MODE
+              value: production
+            - name: MIRROR_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: mirror-api-keys
+                  key: keys
+            - name: MIRROR_PRESET
+              value: medium
+            - name: MIRROR_POPULATION
+              value: "60000"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mirror
+  labels:
+    app.kubernetes.io/name: mirror
+spec:
+  # ClusterIP: false so each pod gets a stable DNS name
+  # (mirror-0.mirror.<ns>.svc) -- what a sticky-session ingress in front of
+  # this service would route on.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: mirror
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

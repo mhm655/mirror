@@ -1,0 +1,17 @@
+# Optional: only applies if the Prometheus Operator's CRDs are installed in
+# the cluster. Scrapes the unauthenticated /metrics endpoint described in
+# ADR-012.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mirror
+  labels:
+    app.kubernetes.io/name: mirror
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mirror
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
