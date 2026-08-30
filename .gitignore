@@ -1,0 +1,30 @@
+# build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+*.pprof
+
+# node
+node_modules/
+web/dist/
+web/.vite/
+.vite/
+
+# local runtime data
+/data/
+*.mirror-ckpt
+*.mirror-log
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# secrets
+.env
+.env.local
+*.pem
