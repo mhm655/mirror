@@ -93,10 +93,12 @@ Open `http://localhost:5173` — Vite proxies `/api` and `/ws` to `:8080`.
 
 ## Known gaps (see PROJECT.md for the full list)
 
-No CI pipeline is wired up yet, no tests exist for `internal/api` or
-`internal/agent`, no Postgres backend (memory/filesystem stores only), and
-deployment manifests in `deploy/` have not been applied against a real
-cluster. Don't assume any of these work until they're actually exercised.
+`internal/api` and `internal/agent` have test coverage now, except for the
+WebSocket byte-level read/write loop and the Anthropic tool-use loop in
+`llm.go` (both need a live connection or model call). No Postgres backend
+(memory/filesystem stores only), and deployment manifests in `deploy/` have
+not been applied against a real cluster. Don't assume any of these work
+until they're actually exercised.
 
 ## House style
 

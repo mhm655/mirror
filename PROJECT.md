@@ -5,7 +5,7 @@ first thing a new session should read to know where things stand, before
 diving into [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the reasoning.
 
 **Repo:** https://github.com/mhm655/mirror (public)
-**Last updated:** 2026-08-30 (added CI)
+**Last updated:** 2026-08-31 (added API/agent tests)
 
 ## Status at a glance
 
@@ -18,7 +18,7 @@ diving into [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the reasoning.
 | Persistence | ⚠️ Memory + filesystem only, no Postgres |
 | Multi-process distribution | ❌ Not built (single-process, in-process "regions" only) |
 | CI | ✅ GitHub Actions on push/PR to `main` |
-| Test coverage | ⚠️ Engine/determinism only — no API/agent/frontend tests |
+| Test coverage | ⚠️ Engine, API, agent covered — no frontend tests, no WebSocket/LLM-loop tests |
 | Deployment | ⚠️ Manifests written, never applied to a real cluster |
 | Docs | ✅ Blueprint + 13 ADRs, current |
 
@@ -104,22 +104,44 @@ ServiceMonitor, Terraform module for the app layer (not a cloud cluster — see
   `go vet ./...`, `go build ./...`, `go test -race ./...`, then re-runs the
   named determinism suite verbosely so failures there are easy to spot in the
   Actions log. `-race` needs cgo, which this Windows dev machine doesn't have
-  set up — it was verified locally without `-race` and is expected to work on
-  the Ubuntu runner, which ships gcc by default; confirm on the first real PR
-  run.
+  set up, so it could only be verified locally without `-race`; confirmed
+  working on the Ubuntu runner itself on the first real push (run succeeded).
 - `frontend` (ubuntu-latest, Node 20): `npm ci`, `npm run typecheck`,
   `npm run build` in `web/`.
+
+**Tests for `internal/api` and `internal/agent`** — previously zero coverage
+outside the determinism suite; now:
+- `internal/api`: `auth_test.go` (role parsing, key add/lookup, the
+  `MIRROR_API_KEYS` env parsing path including the production-mode refusal,
+  credential extraction precedence, rate limiter burst/refill, client IP
+  resolution, audit log ring behaviour), `server_test.go` (an `httptest`
+  harness wired to a real `simctl.Manager` on the `small` preset — auth
+  gating per role, sim create/get/delete, input validation, unknown-field
+  rejection), `stream_test.go` (the `vehiclePos` interpolation math against a
+  hand-built two-node map), `websocket_test.go` (`headerContainsToken`).
+- `internal/agent`: `summarise_test.go` (every `summarise*` report writer,
+  fed hand-built JSON), `tools_test.go` (`numArg`/`b2i`/`minInt`,
+  `policySummary`, tier filtering in `available()`, `simFor` error paths,
+  one live-simulation read tool), `agent_test.go` (`Chat` end-to-end against
+  a real small simulation with no `ANTHROPIC_API_KEY` set, so it exercises
+  the deterministic builtin planner — routing by keyword, the mutate-tier
+  gate, and the fork-run-compare counterfactual path).
+- Deliberately not covered: the WebSocket wire-level read/write loop and the
+  Anthropic tool-use loop in `llm.go` (needs a live or mocked model call) —
+  both noted as gaps below rather than silently skipped.
 
 ## What's not done
 
 Ordered roughly by "most likely to matter next," not by difficulty:
 
-1. **No tests for `internal/api` or `internal/agent`.** The determinism suite
-   is thorough; the HTTP layer, auth, rate limiting, and the agent's tool
-   dispatch have zero automated coverage. A malformed request, an auth
-   bypass, or a tool schema mismatch would currently only be caught by hand.
-2. **No frontend tests.** No Vitest/RTL setup, no component tests, no test for
+1. **No frontend tests.** No Vitest/RTL setup, no component tests, no test for
    the binary frame decoder against a known byte sequence.
+2. **No test coverage for the WebSocket byte-level loop or the Anthropic LLM
+   loop.** `internal/api/websocket.go`'s frame read/write and
+   `internal/agent/llm.go`'s tool-use loop are untested — the former needs a
+   real or piped TCP connection, the latter needs a live or mocked model
+   call. Everything else in both packages now has coverage (see "what's
+   done" above).
 3. **Postgres backend unbuilt.** The schema is documented in the blueprint
    (§8) but `internal/store` only has memory and filesystem implementations.
    Needed before multi-instance / multi-tenant deployment is real.
