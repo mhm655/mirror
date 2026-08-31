@@ -5,7 +5,7 @@ first thing a new session should read to know where things stand, before
 diving into [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the reasoning.
 
 **Repo:** https://github.com/mhm655/mirror (public)
-**Last updated:** 2026-08-30
+**Last updated:** 2026-08-30 (added CI)
 
 ## Status at a glance
 
@@ -17,7 +17,7 @@ diving into [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the reasoning.
 | AI agent | ✅ Working (with or without API key) |
 | Persistence | ⚠️ Memory + filesystem only, no Postgres |
 | Multi-process distribution | ❌ Not built (single-process, in-process "regions" only) |
-| CI | ❌ Not wired up |
+| CI | ✅ GitHub Actions on push/PR to `main` |
 | Test coverage | ⚠️ Engine/determinism only — no API/agent/frontend tests |
 | Deployment | ⚠️ Manifests written, never applied to a real cluster |
 | Docs | ✅ Blueprint + 13 ADRs, current |
@@ -97,38 +97,47 @@ Kubernetes StatefulSet + headless Service + example Secret + optional
 ServiceMonitor, Terraform module for the app layer (not a cloud cluster — see
 `deploy/terraform/main.tf` header comment for why).
 
+## What's done (continued)
+
+**CI** (`.github/workflows/ci.yml`) — two jobs on push/PR to `main`:
+- `backend` (ubuntu-latest, Go 1.24): `gofmt -l` check (excluding `web/`),
+  `go vet ./...`, `go build ./...`, `go test -race ./...`, then re-runs the
+  named determinism suite verbosely so failures there are easy to spot in the
+  Actions log. `-race` needs cgo, which this Windows dev machine doesn't have
+  set up — it was verified locally without `-race` and is expected to work on
+  the Ubuntu runner, which ships gcc by default; confirm on the first real PR
+  run.
+- `frontend` (ubuntu-latest, Node 20): `npm ci`, `npm run typecheck`,
+  `npm run build` in `web/`.
+
 ## What's not done
 
 Ordered roughly by "most likely to matter next," not by difficulty:
 
-1. **No CI.** No `.github/workflows/`. `go test ./...`, `go vet ./...`,
-   `gofmt -l .`, and the frontend typecheck/build should all run on every
-   push/PR. This is probably the single highest-value next step — a project
-   whose README claims tests exist should show them running.
-2. **No tests for `internal/api` or `internal/agent`.** The determinism suite
+1. **No tests for `internal/api` or `internal/agent`.** The determinism suite
    is thorough; the HTTP layer, auth, rate limiting, and the agent's tool
    dispatch have zero automated coverage. A malformed request, an auth
    bypass, or a tool schema mismatch would currently only be caught by hand.
-3. **No frontend tests.** No Vitest/RTL setup, no component tests, no test for
+2. **No frontend tests.** No Vitest/RTL setup, no component tests, no test for
    the binary frame decoder against a known byte sequence.
-4. **Postgres backend unbuilt.** The schema is documented in the blueprint
+3. **Postgres backend unbuilt.** The schema is documented in the blueprint
    (§8) but `internal/store` only has memory and filesystem implementations.
    Needed before multi-instance / multi-tenant deployment is real.
-5. **Multi-tenant isolation designed, not implemented.** `tenant_id` exists in
+4. **Multi-tenant isolation designed, not implemented.** `tenant_id` exists in
    the *documented* schema only; nothing in the running code enforces
    isolation between tenants because there's no tenant concept yet.
-6. **True multi-process distribution doesn't exist.** Everything is one
+5. **True multi-process distribution doesn't exist.** Everything is one
    process with goroutine-based "regions." ADR-008 describes the NATS-based
    migration path; none of it is built. Don't claim distributed execution
    beyond "the consistency model is designed for it and tested in-process."
-7. **Deployment manifests are unexercised.** The Dockerfile has never been
+6. **Deployment manifests are unexercised.** The Dockerfile has never been
    built; the k8s manifests have never been applied; the Terraform has never
    been planned/applied against a real cluster. Treat all of `deploy/` as
    "written, reasoned about, not proven."
-8. **No OSM/real-map import.** Only procedural generation
+7. **No OSM/real-map import.** Only procedural generation
    (`internal/world/gen.go`) exists. `Map` is intentionally generic so an
    importer would be additive (ADR-009), but nobody's written one.
-9. **Untested at the largest scale.** The `huge` preset (hundreds of
+8. **Untested at the largest scale.** The `huge` preset (hundreds of
    thousands of agents) has not been benchmarked — only `small`, `medium`,
    and `large` have captured numbers.
 
